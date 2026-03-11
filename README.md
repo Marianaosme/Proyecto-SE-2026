@@ -1,6 +1,9 @@
-# mi proyecto 
+# Mano robotica
 
-## integrantes 
+## Integrantes 
 
-- Mariana ospina 
-- isaac triana 
+- Mariana Ospina -- lider 
+- Isaac Triana  -- Firmware 
+- Juan Carlos martinez -- Hardware 
+- Simon Eastman -- Pruebas y verificación
+
