@@ -7,7 +7,8 @@
 - Juan Carlos Martínez -- Hardware Integration Engineer
 - Simon Eastman -- Verification & Testing Engineer
 
-## Introdución y Problema 
+
+## Introducción y Problema 
 
 Los sistemas embebidos son sistemas electrónicos diseñados para realizar funciones específicas dentro de un dispositivo más grande, integrando componentes de hardware y software que permiten ejecutar tareas de manera eficiente y automatizada. Estos sistemas se encuentran presentes en múltiples aplicaciones tecnológicas, como dispositivos médicos, sistemas de automatización industrial, vehículos inteligentes y equipos robóticos. 
 
