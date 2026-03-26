@@ -16,13 +16,14 @@
 | RF-10 | La interfaz de usuario permite visualizar errores o eventos relevantes del sistema. | Generar condiciones de error o eventos y verificar que la interfaz los detecte y los muestre correctamente. |
 
 
+
 ## Requisitos No Funcionales
 
 | ID | Requisito No Funcional | Plan de Testing |
 |----|----------------------|-----------------|
-| RNF-01 | Los servos de los dedos se mueven en un rango definido y sin obstrucciones mecánicas. | Ejecutar un programa de control que varíe la señal del servo usando un potenciómetro. Evaluar empíricamente el rango mínimo y máximo de movimiento. Verificar visualmente que no existan bloqueos o interferencias mecánicas. |
-| RNF-02 | Los potenciómetros de los dedos se mueven en el mismo rango que los servos de los dedos. | Medir con un multímetro la variación de voltaje del potenciómetro mientras se mueve en todo su recorrido. |
-| RNF-03 | El servo de la muñeca se mueve en un rango definido y sin obstrucciones mecánicas. | Ejecutar un programa de control utilizando un potenciómetro para variar la posición del servo. Determinar empíricamente los límites de movimiento y verificar posibles obstrucciones. | 
-| RNF-04 | El acelerómetro reconoce y registra los movimientos en los ejes X y Y. | Ejecutar el programa en el entorno de desarrollo y visualizar en la terminal los valores. |
+| RNF-01 | La fuente de alimentación del sistema debe soportar la carga demandada por los componentes. | Medir con un multímetro la corriente consumida y verificar que la fuente de alimentación sea capaz de suministrar la corriente requerida. |
+| RNF-02 | La corriente entregada al ESP32 no debe sobrepasar el límite de seguridad del sistema. | Medir con un multímetro la corriente de salida hacia el ESP32 durante la operación del sistema. |
+| RNF-03 | El sistema de seguridad debe proteger los motores ante sobrecargas. | Aplicar una carga superior al límite de seguridad a un servo y verificar que el sistema detecte la sobrecarga y corte la alimentación del motor. | 
+| RNF-04 | El sistema debe identificar los errores que se muestran en la interfaz. | Generar diferentes condiciones de error en el sistema y verificar que estos sean detectados y reflejados correctamente en la interfaz de usuario. |
 
 
