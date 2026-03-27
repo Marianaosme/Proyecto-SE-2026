@@ -1,4 +1,4 @@
-# Requisitos y Plan de testing 
+# Requisitos y Plan De Testing 
 
 Este documento presenta los requisitos tanto funcionales como no funcionales del proyecto, así como sus respectivo plan de pruebas (testing). Con objetivo es definir el comportamiento esperado del sistema y establecer criterios que permitan validar su correcto funcionamiento tanto a nivel mecánico como electrónico y de software.
 
