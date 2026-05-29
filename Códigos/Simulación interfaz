@@ -1,0 +1,221 @@
+#include <string.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "nvs_flash.h"
+#include "esp_log.h"
+#include "esp_err.h"
+
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
+
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+#include "esp_spp_api.h"
+
+// --- Pines ---
+#define LED_GPIO     GPIO_NUM_26
+#define BUTTON_GPIO  GPIO_NUM_27
+#define POT_CHANNEL  ADC_CHANNEL_0  // GPIO36
+
+// --- LEDC ---
+#define LEDC_TIMER      LEDC_TIMER_0
+#define LEDC_MODE       LEDC_LOW_SPEED_MODE
+#define LEDC_CHANNEL    LEDC_CHANNEL_0
+#define LEDC_DUTY_RES   LEDC_TIMER_8_BIT
+#define LEDC_FREQ_HZ    5000
+
+static const char *TAG = "BT_TEST";
+static const char *DEVICE_NAME = "ESP32_TEST";
+static const char *SPP_SERVER_NAME = "SPP_SERVER";
+
+static uint32_t spp_handle = 0;
+static uint8_t modo = 0;  // 0=ninguno, 1=slider app, 2=potenciómetro
+
+// Handle del ADC
+static adc_oneshot_unit_handle_t adc_handle;
+
+static void pwm_set(uint8_t duty) {
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+}
+
+static void spp_send(const char *msg) {
+    if (spp_handle != 0) {
+        esp_spp_write(spp_handle, strlen(msg), (uint8_t *)msg);
+    }
+}
+
+static void sensor_task(void *arg) {
+    char buf[32];
+    while (1) {
+        // Solo enviar si hay cliente conectado
+        if (spp_handle != 0) {
+            // Pulsador (pull-up: LOW = presionado)
+            int btn = gpio_get_level(BUTTON_GPIO);
+            const char *btn_str = (btn == 0) ? "ON" : "OFF";
+
+            // Potenciómetro 0-4095 → escalar a 0-255
+            int raw = 0;
+            adc_oneshot_read(adc_handle, POT_CHANNEL, &raw);
+            uint8_t pot_val = (uint8_t)(raw * 255 / 4095);
+
+            // Si modo potenciómetro, aplicar PWM
+            if (modo == 2) {
+                pwm_set(pot_val);
+            }
+
+            // Enviar "ON;127\n" o "OFF;0\n"
+            snprintf(buf, sizeof(buf), "%s;%d\n", btn_str, pot_val);
+            spp_send(buf);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+    if (event == ESP_BT_GAP_AUTH_CMPL_EVT) {
+        ESP_LOGI(TAG, "Autenticacion completada");
+    }
+}
+
+static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
+    switch (event) {
+        case ESP_SPP_INIT_EVT:
+            esp_bt_gap_set_device_name(DEVICE_NAME);
+            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+            esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, SPP_SERVER_NAME);
+            break;
+
+        case ESP_SPP_SRV_OPEN_EVT:
+            spp_handle = param->srv_open.handle;
+            modo = 0;
+            ESP_LOGI(TAG, "Cliente conectado");
+            break;
+
+        case ESP_SPP_CLOSE_EVT:
+            spp_handle = 0;
+            modo = 0;
+            pwm_set(0);  // apagar LED al desconectar
+            ESP_LOGI(TAG, "Cliente desconectado");
+            break;
+
+        case ESP_SPP_DATA_IND_EVT: {
+            if (param->data_ind.len > 0) {
+                // Copiar a buffer local y null-terminar
+                char buf[64] = {0};
+                int len = param->data_ind.len;
+                if (len > (int)sizeof(buf) - 1) len = sizeof(buf) - 1;
+                memcpy(buf, param->data_ind.data, len);
+
+                ESP_LOGI(TAG, "Recibido: %s", buf);
+
+                if (buf[0] == '1') {
+                    modo = 1;
+                    ESP_LOGI(TAG, "Modo: SLIDER APP");
+
+                } else if (buf[0] == '2') {
+                    modo = 2;
+                    ESP_LOGI(TAG, "Modo: POTENCIOMETRO");
+
+                } else if (buf[0] == 'P' && buf[1] == ':') {
+                    // La app envía "P:45" → parsear el número después de ":"
+                    if (modo == 1) {
+                        int valor = atoi(&buf[2]);       // extrae "45" como entero
+                        if (valor < 0)   valor = 0;
+                        if (valor > 100) valor = 100;
+                        uint8_t duty = (uint8_t)(valor * 255 / 100);
+                        pwm_set(duty);
+                        ESP_LOGI(TAG, "PWM slider: %d%% -> duty %d", valor, duty);
+                    }
+                }
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void app_main(void) {
+    // NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    // GPIO pulsador pull-up interno
+    gpio_config_t btn_conf = {
+        .pin_bit_mask  = (1ULL << BUTTON_GPIO),
+        .mode          = GPIO_MODE_INPUT,
+        .pull_up_en    = GPIO_PULLUP_ENABLE,
+        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
+        .intr_type     = GPIO_INTR_DISABLE
+    };
+    gpio_config(&btn_conf);
+
+    // ADC oneshot (API actual de ESP-IDF v5)
+    adc_oneshot_unit_init_cfg_t adc_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&adc_cfg, &adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,   // 0-3.3V
+        .bitwidth = ADC_BITWIDTH_12,   // 0-4095
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT_CHANNEL, &chan_cfg));
+
+    // LEDC (PWM)
+    ledc_timer_config_t ledc_timer_cfg = {
+        .speed_mode      = LEDC_MODE,
+        .timer_num       = LEDC_TIMER,
+        .duty_resolution = LEDC_DUTY_RES,
+        .freq_hz         = LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer_cfg));
+
+    ledc_channel_config_t ledc_ch_cfg = {
+        .speed_mode = LEDC_MODE,
+        .channel    = LEDC_CHANNEL,
+        .timer_sel  = LEDC_TIMER,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .gpio_num   = LED_GPIO,
+        .duty       = 0,
+        .hpoint     = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_ch_cfg));
+
+    // Bluetooth SPP
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    ESP_ERROR_CHECK(esp_bt_gap_register_callback(gap_callback));
+    ESP_ERROR_CHECK(esp_spp_register_callback(spp_callback));
+
+    esp_spp_cfg_t spp_cfg = {
+        .mode            = ESP_SPP_MODE_CB,
+        .enable_l2cap_ertm = true,
+        .tx_buffer_size  = 0
+    };
+    ESP_ERROR_CHECK(esp_spp_enhanced_init(&spp_cfg));
+
+    // Tarea de sensores
+    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Listo. BT: %s", DEVICE_NAME);
+}
