@@ -1,0 +1,410 @@
+/*
+ * ============================================================
+ *  TEST 2 SERVOS SG90 - ESP32
+ *  Framework: ESP-IDF | Stack BT: Bluedroid | Perfil: SPP
+ * ============================================================
+ *
+ *  MAPA DE PINES
+ * ──────────────────────────────────────────────────────────
+ *  SERVOS SG90 (PWM 50Hz):
+ *    GPIO 26 → Servo 1   (LEDC CH0)
+ *    GPIO 25 → Servo 2   (LEDC CH1)
+ *
+ *  POTENCIÓMETROS (ADC1 - compatible con Bluetooth):
+ *    GPIO 36 (ADC1_CH0) → Pot 1 → controla Servo 1
+ *    GPIO 39 (ADC1_CH3) → Pot 2 → controla Servo 2
+ *
+ *  PULSADOR (estado ON/OFF → Label14 en App Inventor):
+ *    GPIO 27 → Pull-up interno (LOW = presionado = ON)
+ *
+ *  PROTOCOLO SPP (app → ESP32):
+ *    "1"      → Modo slider  (Slider1 controla Servo1,
+ *                             Slider2 controla Servo2)
+ *    "2"      → Modo guante  (Pot1 controla Servo1,
+ *                             Pot2 controla Servo2)
+ *    "P1:XX"  → Mover Servo 1 a XX grados (modo slider)
+ *    "P2:XX"  → Mover Servo 2 a XX grados (modo slider)
+ *
+ *  TELEMETRÍA (ESP32 → app, cada 200ms):
+ *    "ON;A1;A2\n"  o  "OFF;A1;A2\n"
+ *    ON/OFF = estado del pulsador
+ *    A1     = ángulo actual Servo 1 (0-180°)
+ *    A2     = ángulo actual Servo 2 (0-180°)
+ *
+ *  Parsing en App Inventor (split por ";"):
+ *    posición 1 → Label14 (ON / OFF)
+ *    posición 2 → ángulo Servo 1
+ *    posición 3 → ángulo Servo 2
+ * ============================================================
+ */
+
+#include <string.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "nvs_flash.h"
+#include "esp_log.h"
+#include "esp_err.h"
+
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
+
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+#include "esp_spp_api.h"
+
+/* ============================================================
+ *  ETIQUETA DE LOGGING
+ * ============================================================ */
+static const char *TAG = "TEST_2_SERVOS";
+
+/* ============================================================
+ *  PINES
+ * ============================================================ */
+#define SERVO1_GPIO     GPIO_NUM_26   /* Servo 1 - SG90 */
+#define SERVO2_GPIO     GPIO_NUM_25   /* Servo 2 - SG90 */
+#define BUTTON_GPIO     GPIO_NUM_27   /* Pulsador pull-up */
+
+/* ============================================================
+ *  ADC - POTENCIÓMETROS (solo ADC1, compatible con BT)
+ * ============================================================ */
+#define POT1_CHANNEL    ADC_CHANNEL_0   /* GPIO 36 → Servo 1 */
+#define POT2_CHANNEL    ADC_CHANNEL_3   /* GPIO 39 → Servo 2 */
+
+/* ============================================================
+ *  LEDC - PWM SERVOS
+ *  50 Hz, resolución 16 bits
+ *  Pulso mínimo ~500µs  → duty ≈ 1638  (0°)
+ *  Pulso máximo ~2500µs → duty ≈ 8192  (180°)
+ * ============================================================ */
+#define LEDC_TIMER        LEDC_TIMER_0
+#define LEDC_MODE         LEDC_LOW_SPEED_MODE
+#define LEDC_DUTY_RES     LEDC_TIMER_16_BIT
+#define LEDC_FREQ_HZ      50
+
+#define SERVO_MIN_DUTY    1638
+#define SERVO_MAX_DUTY    8192
+
+#define CH_SERVO1         LEDC_CHANNEL_0
+#define CH_SERVO2         LEDC_CHANNEL_1
+
+/* ============================================================
+ *  BLUETOOTH SPP
+ * ============================================================ */
+static const char *DEVICE_NAME     = "ESP32_2SERVOS";
+static const char *SPP_SERVER_NAME = "SPP_SERVER";
+static uint32_t    spp_handle      = 0;
+
+/* ============================================================
+ *  MODOS DE OPERACIÓN
+ * ============================================================ */
+#define MODO_NINGUNO   0
+#define MODO_SLIDER    1   /* Button1: sliders de la app */
+#define MODO_GUANTE    2   /* Button2: potenciómetros físicos */
+
+static uint8_t modo = MODO_NINGUNO;
+
+/* ============================================================
+ *  ESTADO DE ÁNGULOS
+ * ============================================================ */
+static volatile uint8_t angulo_servo1 = 90;
+static volatile uint8_t angulo_servo2 = 90;
+
+/* ============================================================
+ *  HANDLE ADC
+ * ============================================================ */
+static adc_oneshot_unit_handle_t adc_handle;
+
+/* ============================================================
+ *  FUNCIÓN: mover servo a ángulo 0-180°
+ * ============================================================ */
+static void servo_set(ledc_channel_t channel, uint8_t angle)
+{
+    if (angle > 180) angle = 180;
+    uint32_t duty = SERVO_MIN_DUTY +
+                    ((uint32_t)(SERVO_MAX_DUTY - SERVO_MIN_DUTY) * angle / 180);
+    ledc_set_duty(LEDC_MODE, channel, duty);
+    ledc_update_duty(LEDC_MODE, channel);
+}
+
+/* ============================================================
+ *  FUNCIÓN: llevar ambos servos a posición neutral (90°)
+ * ============================================================ */
+static void servos_neutral(void)
+{
+    servo_set(CH_SERVO1, 90);
+    servo_set(CH_SERVO2, 90);
+    angulo_servo1 = 90;
+    angulo_servo2 = 90;
+}
+
+/* ============================================================
+ *  FUNCIÓN: enviar texto por SPP
+ * ============================================================ */
+static void spp_send(const char *msg)
+{
+    if (spp_handle != 0) {
+        esp_spp_write(spp_handle, strlen(msg), (uint8_t *)msg);
+    }
+}
+
+/* ============================================================
+ *  TAREA DE SENSORES Y TELEMETRÍA (200ms)
+ *  - Lee pulsador y 2 potenciómetros
+ *  - En modo guante aplica pots a servos
+ *  - Envía "ON/OFF;A1;A2\n" por SPP
+ * ============================================================ */
+static void sensor_task(void *arg)
+{
+    char buf[32];
+
+    while (1) {
+        /* --- Leer pulsador (pull-up: LOW = presionado = ON) --- */
+        int btn = gpio_get_level(BUTTON_GPIO);
+        const char *btn_str = (btn == 0) ? "ON" : "OFF";
+
+        /* --- Leer potenciómetros (0-4095 → 0-180°) --- */
+        int raw1 = 0, raw2 = 0;
+        adc_oneshot_read(adc_handle, POT1_CHANNEL, &raw1);
+        adc_oneshot_read(adc_handle, POT2_CHANNEL, &raw2);
+
+        uint8_t pot_angle1 = (uint8_t)(raw1 * 180 / 4095);
+        uint8_t pot_angle2 = (uint8_t)(raw2 * 180 / 4095);
+
+        /* --- Aplicar potenciómetros en modo guante --- */
+        if (modo == MODO_GUANTE) {
+            servo_set(CH_SERVO1, pot_angle1);
+            servo_set(CH_SERVO2, pot_angle2);
+            angulo_servo1 = pot_angle1;
+            angulo_servo2 = pot_angle2;
+        }
+
+        /* --- Enviar telemetría por SPP --- */
+        if (spp_handle != 0) {
+            snprintf(buf, sizeof(buf), "%s;%d;%d\n",
+                     btn_str, angulo_servo1, angulo_servo2);
+            spp_send(buf);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+/* ============================================================
+ *  PROCESAMIENTO DE COMANDOS RECIBIDOS POR SPP
+ * ============================================================ */
+static void procesar_comando(const char *buf, int len)
+{
+    if (len < 1) return;
+
+    /* "1" → modo slider */
+    if (buf[0] == '1') {
+        modo = MODO_SLIDER;
+        ESP_LOGI(TAG, "Modo: SLIDER");
+        return;
+    }
+
+    /* "2" → modo guante (potenciómetros) */
+    if (buf[0] == '2') {
+        modo = MODO_GUANTE;
+        ESP_LOGI(TAG, "Modo: GUANTE (potenciometros)");
+        return;
+    }
+
+    /* "P1:XX" → mover Servo 1 a XX° */
+    if (buf[0] == 'P' && buf[1] == '1' && buf[2] == ':') {
+        if (modo == MODO_SLIDER) {
+            int angle = atoi(&buf[3]);
+            if (angle < 0)   angle = 0;
+            if (angle > 180) angle = 180;
+            servo_set(CH_SERVO1, (uint8_t)angle);
+            angulo_servo1 = (uint8_t)angle;
+            ESP_LOGI(TAG, "Servo1 → %d°", angle);
+        }
+        return;
+    }
+
+    /* "P2:XX" → mover Servo 2 a XX° */
+    if (buf[0] == 'P' && buf[1] == '2' && buf[2] == ':') {
+        if (modo == MODO_SLIDER) {
+            int angle = atoi(&buf[3]);
+            if (angle < 0)   angle = 0;
+            if (angle > 180) angle = 180;
+            servo_set(CH_SERVO2, (uint8_t)angle);
+            angulo_servo2 = (uint8_t)angle;
+            ESP_LOGI(TAG, "Servo2 → %d°", angle);
+        }
+        return;
+    }
+
+    ESP_LOGW(TAG, "Comando desconocido: %s", buf);
+}
+
+/* ============================================================
+ *  CALLBACK GAP
+ * ============================================================ */
+static void gap_callback(esp_bt_gap_cb_event_t event,
+                         esp_bt_gap_cb_param_t *param)
+{
+    if (event == ESP_BT_GAP_AUTH_CMPL_EVT) {
+        ESP_LOGI(TAG, "Autenticacion BT completada");
+    }
+}
+
+/* ============================================================
+ *  CALLBACK SPP
+ * ============================================================ */
+static void spp_callback(esp_spp_cb_event_t event,
+                         esp_spp_cb_param_t *param)
+{
+    switch (event) {
+
+        case ESP_SPP_INIT_EVT:
+            esp_bt_gap_set_device_name(DEVICE_NAME);
+            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                                     ESP_BT_GENERAL_DISCOVERABLE);
+            esp_spp_start_srv(ESP_SPP_SEC_NONE,
+                              ESP_SPP_ROLE_SLAVE,
+                              0,
+                              SPP_SERVER_NAME);
+            ESP_LOGI(TAG, "SPP inicializado");
+            break;
+
+        case ESP_SPP_START_EVT:
+            ESP_LOGI(TAG, "Servidor SPP listo");
+            break;
+
+        case ESP_SPP_SRV_OPEN_EVT:
+            spp_handle = param->srv_open.handle;
+            modo = MODO_NINGUNO;
+            ESP_LOGI(TAG, "Cliente conectado");
+            break;
+
+        case ESP_SPP_CLOSE_EVT:
+            spp_handle = 0;
+            modo = MODO_NINGUNO;
+            servos_neutral();
+            ESP_LOGI(TAG, "Cliente desconectado - servos a 90 grados");
+            break;
+
+        case ESP_SPP_DATA_IND_EVT: {
+            if (param->data_ind.len > 0) {
+                char buf[64] = {0};
+                int len = param->data_ind.len;
+                if (len > (int)sizeof(buf) - 1) len = sizeof(buf) - 1;
+                memcpy(buf, param->data_ind.data, len);
+                ESP_LOGI(TAG, "RX: %s", buf);
+                procesar_comando(buf, len);
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+/* ============================================================
+ *  APP MAIN
+ * ============================================================ */
+void app_main(void)
+{
+    /* --- NVS --- */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    /* --- GPIO pulsador (pull-up interno) --- */
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << BUTTON_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+    gpio_config(&btn_cfg);
+
+    /* --- ADC oneshot (potenciómetros) --- */
+    adc_oneshot_unit_init_cfg_t adc_cfg = { .unit_id = ADC_UNIT_1 };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&adc_cfg, &adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT1_CHANNEL, &chan_cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT2_CHANNEL, &chan_cfg));
+
+    /* --- LEDC (PWM servos) --- */
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode      = LEDC_MODE,
+        .timer_num       = LEDC_TIMER,
+        .duty_resolution = LEDC_DUTY_RES,
+        .freq_hz         = LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+    ledc_channel_config_t ch1_cfg = {
+        .speed_mode = LEDC_MODE,
+        .channel    = CH_SERVO1,
+        .timer_sel  = LEDC_TIMER,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .gpio_num   = SERVO1_GPIO,
+        .duty       = 0,
+        .hpoint     = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ch1_cfg));
+
+    ledc_channel_config_t ch2_cfg = {
+        .speed_mode = LEDC_MODE,
+        .channel    = CH_SERVO2,
+        .timer_sel  = LEDC_TIMER,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .gpio_num   = SERVO2_GPIO,
+        .duty       = 0,
+        .hpoint     = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ch2_cfg));
+
+    /* --- Posición inicial 90° --- */
+    servos_neutral();
+    ESP_LOGI(TAG, "Servos en posicion neutral (90 grados)");
+
+    /* --- Bluetooth SPP --- */
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    ESP_ERROR_CHECK(esp_bt_gap_register_callback(gap_callback));
+    ESP_ERROR_CHECK(esp_spp_register_callback(spp_callback));
+
+    esp_spp_cfg_t spp_cfg = {
+        .mode              = ESP_SPP_MODE_CB,
+        .enable_l2cap_ertm = true,
+        .tx_buffer_size    = 0
+    };
+    ESP_ERROR_CHECK(esp_spp_enhanced_init(&spp_cfg));
+
+    /* --- Tarea de sensores --- */
+    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Listo. Dispositivo BT: %s", DEVICE_NAME);
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
